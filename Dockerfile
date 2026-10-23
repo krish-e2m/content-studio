@@ -1,13 +1,8 @@
-# Railway build for the Content Engine — the Express API in server/ also serves
+# Container build for Content Studio — the Express API in server/ also serves
 # the built React client (client/dist) as a single service.
 #
-# Why this exists: the brand extractor drives a headless browser via
-# `puppeteer-core`, which ships NO Chromium binary. Railway's default Nixpacks
-# build has no Chrome, so the extractor can't launch and brand COLORS come back
-# empty. This image installs a system Chromium and points puppeteer at it.
-#
-# Node 22 (not 20): @supabase/supabase-js requires a global WebSocket, which is
-# only native from Node 22 — on Node 20 it throws at boot in db.js.
+# Headless Chromium is installed for the brand extractor (puppeteer-core).
+# Node 22: @supabase/supabase-js requires global WebSocket support.
 FROM node:22-slim
 
 # Chromium + the bits a headless browser needs. apt pulls in Chromium's own
