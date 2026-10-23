@@ -1,0 +1,15 @@
+# Keep the build context lean and never bake secrets or local installs into the
+# image. Deps are installed fresh inside the Dockerfile; the client is rebuilt.
+node_modules
+**/node_modules
+client/dist
+client/.vite
+server/extractions
+.git
+.gitignore
+.env
+**/.env
+*.log
+npm-debug.log*
+.DS_Store
+**/.DS_Store

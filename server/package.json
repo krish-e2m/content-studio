@@ -1,0 +1,22 @@
+{
+  "name": "content-engine-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Node/Express API for the Content Engine - client onboarding (Supabase).",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.202",
+    "@supabase/supabase-js": "2.75.0",
+    "cheerio": "^1.2.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "multer": "^1.4.5-lts.1",
+    "pdf-parse": "^1.1.1",
+    "puppeteer-core": "^23.10.4"
+  }
+}

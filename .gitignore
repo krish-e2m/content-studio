@@ -1,0 +1,30 @@
+# dependencies (any level)
+node_modules
+
+# package-manager lockfiles
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# misc
+.DS_Store
+*.log
+dist
+
+# Daily runtime logs (server/logger.js). One file per day, auto-deleted after 7 days.
+logs/
+
+# brand extractor output (generated screenshots / assets / branding.json)
+extractions
+
+# Server-side scrape cache (Apify results). Regenerated on refresh.
+server/.cache/
+
+# Design Docs
+FDD.md
+TDD.md

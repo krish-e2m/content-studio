@@ -1,0 +1,321 @@
+// =============================================================================
+// AI brand extraction: crawl a website (sitemap + links + common paths) → pull
+// colors / fonts / copy → have Claude Haiku 4.5 (over OpenRouter) infer a
+// structured brand identity + voices.
+// =============================================================================
+import { load } from 'cheerio'
+import pdfParse from 'pdf-parse/lib/pdf-parse.js'
+import { chatComplete, parseJsonBlock, HAIKU } from './openrouter.js'
+
+const UA = 'Mozilla/5.0 (compatible; ContentEngineBot/1.0)'
+const MAX_PAGES = Number(process.env.CRAWL_MAX_PAGES) || 20
+const COMMON_PATHS = [
+  '/about', '/about-us', '/services', '/work', '/case-studies', '/portfolio',
+  '/pricing', '/blog', '/contact', '/team', '/products', '/features',
+  '/how-it-works', '/company', '/story', '/manifesto',
+]
+
+async function fetchWithTimeout(url, ms = 6000) {
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), ms)
+  try {
+    return await fetch(url, { redirect: 'follow', signal: ctrl.signal, headers: { 'user-agent': UA } })
+  } finally {
+    clearTimeout(t)
+  }
+}
+
+const pathKey = (u) => {
+  try { return new URL(u).pathname.replace(/\/+$/, '') || '/' } catch { return u }
+}
+
+// Fetch + parse one HTML page → { url, title, text, css, links[], cssUrls[] } or null.
+async function fetchPage(url, origin) {
+  let html
+  try {
+    const r = await fetchWithTimeout(url)
+    if (!r.ok || !(r.headers.get('content-type') || '').includes('text/html')) return null
+    html = await r.text()
+  } catch {
+    return null
+  }
+  const $ = load(html)
+  $('script, noscript').remove()
+  const inlineCss = $('style').map((_, el) => $(el).text()).get().join('\n')
+  const styleAttrs = $('[style]').map((_, el) => $(el).attr('style')).get().join(';')
+  $('style').remove()
+  const title = $('title').first().text().trim()
+  // meta tags carry real signal even on JS-only SPAs (where body text is sparse)
+  const meta = [
+    $('meta[name="description"]').attr('content'),
+    $('meta[property="og:title"]').attr('content'),
+    $('meta[property="og:description"]').attr('content'),
+    $('meta[name="twitter:description"]').attr('content'),
+  ].filter(Boolean)
+  const body = $('body').text().replace(/\s+/g, ' ').trim()
+  const text = [...meta, body].join(' · ').replace(/\s+/g, ' ').trim()
+
+  const links = []
+  $('a[href]').each((_, el) => {
+    try {
+      const abs = new URL($(el).attr('href'), url)
+      if (abs.origin === origin && /^https?:$/.test(abs.protocol)) links.push(abs.href)
+    } catch {}
+  })
+  const cssUrls = []
+  $('link[rel="stylesheet"]').each((_, el) => {
+    const href = $(el).attr('href')
+    if (href) { try { cssUrls.push(new URL(href, url).href) } catch {} }
+  })
+  return { url, title, text, css: `${inlineCss}\n${styleAttrs}`, links, cssUrls }
+}
+
+// Light, single-page read of a site's homepage → title + meta + visible text,
+// truncated. Used to ground other features (e.g. the trends stream) in what the
+// client ACTUALLY does, straight from their own website — without the cost of a
+// full multi-page crawl. Returns '' on any failure (best-effort).
+export async function fetchSiteSummary(url, maxChars = 1200) {
+  try {
+    const domain = String(url || '').replace(/^https?:\/\//i, '').replace(/\/.*$/, '').replace(/^www\./, '')
+    if (!domain) return ''
+    const startUrl = `https://${domain}`
+    const page = await fetchPage(startUrl, new URL(startUrl).origin)
+    const text = `${page?.title ? page.title + ' · ' : ''}${page?.text || ''}`.trim()
+    return text ? text.slice(0, maxChars) : ''
+  } catch {
+    return ''
+  }
+}
+
+// Pull every URL listed in sitemap.xml / sitemap_index.xml (one level of nesting).
+async function discoverFromSitemap(origin) {
+  const out = new Set()
+  let nested = 0
+  const grab = (xml) => [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)].map((m) => m[1])
+  for (const sm of [`${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`]) {
+    try {
+      const r = await fetchWithTimeout(sm)
+      if (!r.ok) continue
+      for (const loc of grab(await r.text())) {
+        if (/\.xml(\?|$)/i.test(loc)) {
+          if (out.size > 200 || nested >= 10) continue // cap nested sitemap fetches
+          nested++
+          try {
+            const rr = await fetchWithTimeout(loc)
+            if (rr.ok) grab(await rr.text()).forEach((u) => out.add(u))
+          } catch {}
+        } else {
+          out.add(loc)
+        }
+      }
+    } catch {}
+  }
+  return [...out]
+}
+
+const isAsset = (pathname) =>
+  /\.(pdf|jpe?g|png|gif|svg|webp|ico|zip|mp4|mov|css|js|xml|json|txt|woff2?)(\?|$)/i.test(pathname)
+
+async function crawlSite(startUrl, maxPages = MAX_PAGES) {
+  const startOrigin = new URL(startUrl).origin
+
+  // 1) homepage (gives links + content; may be a sparse SPA shell)
+  const home = await fetchPage(startUrl, startOrigin)
+
+  // 2) sitemap. Sites sometimes host their real content on a sister domain
+  //    (e.g. a .ca SPA whose sitemap points at the .com), so we TRUST whatever
+  //    origins the sitemap declares - not just the start origin.
+  const sitemap = await discoverFromSitemap(startOrigin)
+  const allowed = new Set([startOrigin])
+  for (const u of sitemap) { try { allowed.add(new URL(u).origin) } catch {} }
+
+  const seen = new Set()
+  const key = (u) => `${new URL(u).origin}${pathKey(u)}`
+  if (home) seen.add(key(startUrl))
+
+  // sitemap first (authoritative), then homepage links, then common-path guesses
+  const candidates = []
+  const pool = [...sitemap, ...(home?.links || []), ...COMMON_PATHS.map((p) => startOrigin + p)]
+  for (const u of pool) {
+    let abs
+    try { abs = new URL(u, startUrl) } catch { continue }
+    if (!allowed.has(abs.origin) || isAsset(abs.pathname)) continue
+    const k = key(abs.href)
+    if (seen.has(k)) continue
+    seen.add(k)
+    candidates.push(abs.href)
+  }
+
+  // 3) fetch candidates concurrently in small batches until we hit maxPages
+  const pages = home ? [home] : []
+  const cssUrls = new Set(home?.cssUrls || [])
+  const toFetch = candidates.slice(0, Math.max(1, maxPages - pages.length) * 2) // overscan; some 404
+  const batch = 6
+  for (let i = 0; i < toFetch.length && pages.length < maxPages; i += batch) {
+    const results = await Promise.all(toFetch.slice(i, i + batch).map((u) => fetchPage(u, new URL(u).origin)))
+    for (const p of results) {
+      if (p && pages.length < maxPages) {
+        pages.push(p)
+        p.cssUrls.forEach((c) => cssUrls.add(c))
+      }
+    }
+  }
+  if (!pages.length) throw new Error('Could not read that website')
+  return { pages, cssUrls: [...cssUrls].slice(0, 8) }
+}
+
+const normalizeHex = (h) => {
+  const s = h.toLowerCase()
+  return /^#[0-9a-f]{3}$/.test(s) ? '#' + s.slice(1).split('').map((c) => c + c).join('') : s
+}
+const toHex2 = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0')
+const rgbToHex = (r, g, b) => `#${toHex2(r)}${toHex2(g)}${toHex2(b)}`
+const hslToHex = (h, s, l) => {
+  s /= 100
+  l /= 100
+  const k = (n) => (n + h / 30) % 12
+  const a = s * Math.min(l, 1 - l)
+  const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))
+  return rgbToHex(255 * f(0), 255 * f(8), 255 * f(4))
+}
+
+// Pull brand colors from CSS in ANY common format (hex, rgb/rgba, hsl/hsla),
+// normalize to hex, and rank by frequency.
+function extractColors(css) {
+  const counts = {}
+  const add = (hex) => { counts[hex] = (counts[hex] || 0) + 1 }
+  ;(css.match(/#[0-9a-fA-F]{6}\b|#[0-9a-fA-F]{3}\b/g) || []).forEach((h) => add(normalizeHex(h)))
+  ;[...css.matchAll(/rgba?\(\s*(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})(?:[\s,/]+([\d.]+%?))?\s*\)/gi)].forEach((m) => {
+    if (m[4] !== undefined && parseFloat(m[4]) === 0) return // skip fully transparent
+    add(rgbToHex(+m[1], +m[2], +m[3]))
+  })
+  ;[...css.matchAll(/hsla?\(\s*([\d.]+)(?:deg)?[\s,]+([\d.]+)%[\s,]+([\d.]+)%(?:[\s,/]+([\d.]+%?))?\s*\)/gi)].forEach((m) => {
+    if (m[4] !== undefined && parseFloat(m[4]) === 0) return
+    add(hslToHex(+m[1], +m[2], +m[3]))
+  })
+  return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 24).map(([hex, count]) => ({ hex, count }))
+}
+
+function extractFonts(css) {
+  const generic = /^(sans-serif|serif|monospace|system-ui|ui-monospace|ui-serif|ui-sans-serif|inherit|initial|unset|-apple-system|blinkmacsystemfont|arial|helvetica|times|courier|georgia|verdana|tahoma|segoe ui)$/i
+  const counts = {}
+  ;(css.match(/font-family\s*:\s*([^;}{]+)/gi) || []).forEach((decl) => {
+    ;(decl.split(':')[1] || '').split(',').forEach((name) => {
+      const n = name.replace(/["']/g, '').trim()
+      if (n && !generic.test(n) && n.length < 40) counts[n] = (counts[n] || 0) + 1
+    })
+  })
+  return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([f]) => f)
+}
+
+const SYS =
+  'You are a senior brand strategist. From a website\'s content plus detected colors and fonts, infer a structured brand identity AND the brand voices. Be faithful to the evidence; if something is not determinable, use an empty string or empty array. Return ONLY a JSON object.'
+
+function userPrompt({ domain, corpus, colors, fonts }) {
+  return `Website: ${domain}
+
+DETECTED COLORS (hex by frequency - this is GROUND TRUTH; use these exact hex values, never invent colors):
+${JSON.stringify(colors)}
+
+DETECTED FONT FAMILIES (by frequency):
+${JSON.stringify(fonts)}
+
+PAGE CONTENT (multiple crawled pages, truncated):
+${corpus}
+
+Capture WHAT THE BRAND DOES in positioning.statement and mission.
+Also propose 3-5 content_pillars: named themes the brand can repeatedly create content around
+(name + one-sentence description), inferred from what they actually talk about — not generic
+marketing buckets.
+For "voices": derive a Brand voice (pov "brand_we") and, if a founder or named person is
+evident, a Founder voice (pov "first_person"). For each voice give 3-5 tone_attributes, a few
+dos and donts, and 1-3 short sample_posts WRITTEN IN THAT VOICE using the brand's real themes
+and wording. If no founder is evident, return only the brand voice.
+COLORS: map the DETECTED COLORS into the palette - do NOT invent hex values and do NOT return
+just one or two. Put the 2-4 dominant brand colors in "primary" (each with a role like
+ink/paper/accent and a rough weight % if discernible). Put EVERY other meaningful colour
+(surfaces, backgrounds, borders/hairlines, muted text, secondary accents) in "supporting" -
+typically 4-8 of them. Only drop near-duplicates and obvious one-off utility shades.
+List each distinct font family with its role (headings, body, labels…).
+WORDMARK: derive usage guidance from the brand name, logo and typography. Set "rules" to 1-2
+sentences on how the name / wordmark should be set (case, weight, style, lockup, clearspace) and
+give 2-4 "donts" (e.g. don't stretch, recolor, outline, add effects, or tilt it). Infer this from
+the evidence - only leave them "" / [] if there is genuinely nothing to go on.
+
+Return JSON with EXACTLY this shape (keep arrays short and meaningful):
+{
+  "brand_tone": "1-2 sentences on how they sound",
+  "mission": "what the brand does / its purpose",
+  "keywords": ["themes to lean into"],
+  "avoid_words": ["themes/words to avoid, inferred from tone"],
+  "content_pillars": [
+    { "name": "short pillar name", "description": "1 sentence on the stories/angles this pillar covers" }
+  ],
+  "positioning": { "tagline": "", "statement": "one paragraph on what they do" },
+  "voices": [
+    { "kind": "brand",   "name": "", "pov": "brand_we",     "tone_attributes": [], "dos": [], "donts": [], "sample_posts": [] },
+    { "kind": "founder", "name": "", "pov": "first_person", "tone_attributes": [], "dos": [], "donts": [], "sample_posts": [] }
+  ],
+  "colors": {
+    "primary": [ { "name": "", "hex": "#000000", "role": "ink|paper|accent|primary|secondary", "weight": "" } ],
+    "supporting": [ { "name": "", "hex": "#000000" } ],
+    "rule": ""
+  },
+  "typography": { "fonts": [ { "family": "", "role": "" } ] },
+  "wordmark": { "rules": "", "donts": [] }
+}`
+}
+
+async function extractStructuredBrand(input) {
+  const { text } = await chatComplete({
+    model: HAIKU(),
+    temperature: 0.2, // low: this is extraction, not creative writing
+    maxTokens: 4000,
+    messages: [
+      { role: 'system', content: SYS },
+      { role: 'user', content: userPrompt(input) },
+    ],
+  })
+  const data = parseJsonBlock(text)
+  if (!data || !Object.keys(data).length) throw new Error('The model returned no usable brand data')
+  return data
+}
+
+export async function extractBrandFromSite(url) {
+  const domain = new URL(/^https?:\/\//i.test(url) ? url : `https://${url}`).hostname.replace(/^www\./, '')
+  const { pages, cssUrls } = await crawlSite(`https://${domain}`)
+  if (!pages.length) throw new Error('Could not read that website')
+
+  // fetch external stylesheets in parallel (sequential was a latency trap)
+  const cssTexts = await Promise.all(
+    cssUrls.map(async (u) => {
+      try { const r = await fetchWithTimeout(u, 5000); return r.ok ? await r.text() : '' } catch { return '' }
+    }),
+  )
+  const css = [pages.map((p) => p.css).join('\n'), ...cssTexts].join('\n')
+
+  const colors = extractColors(css)
+  const fonts = extractFonts(css)
+  const corpus = pages.map((p) => `## ${p.title} (${p.url})\n${p.text.slice(0, 2200)}`).join('\n\n').slice(0, 16000)
+
+  const data = await extractStructuredBrand({ domain, corpus, colors, fonts })
+  return { data, meta: { domain, pages: pages.map((p) => p.url), colors, fonts } }
+}
+
+// Parse an uploaded brand-guide PDF → text → Haiku 4.5 → structured brand
+// identity. (Brand guides spell out hex codes + font names in the text, so the
+// LLM reads them directly; no CSS to scrape.)
+export async function extractBrandFromPdf(buffer, label = 'uploaded PDF') {
+  let parsed
+  try {
+    parsed = await pdfParse(buffer)
+  } catch {
+    throw new Error('Could not read that PDF')
+  }
+  const text = (parsed.text || '').replace(/\s+/g, ' ').trim()
+  if (text.length < 30) throw new Error('That PDF has no extractable text (it may be scanned images)')
+  const colors = extractColors(text)
+  const corpus = text.slice(0, 16000)
+  const data = await extractStructuredBrand({ domain: label, corpus, colors, fonts: [] })
+  return { data, meta: { source: 'pdf', label, chars: text.length, colors } }
+}

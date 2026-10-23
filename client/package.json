@@ -1,0 +1,23 @@
+{
+  "name": "content-studio",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Content Studio - Client Content Creation Workspace.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "marked": "^18.0.5",
+    "motion": "^12.40.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.18.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.7"
+  }
+}

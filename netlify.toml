@@ -1,0 +1,16 @@
+# Netlify build config - deploys the Vite/React client in client/.
+# The Express API in server/ is NOT hosted here (Netlify can't run a
+# persistent server); deploy it to Render/Railway and point the client at
+# it via the VITE_API_URL environment variable in Netlify's UI.
+
+[build]
+  base = "client"          # run the build from client/
+  command = "npm run build"
+  publish = "dist"         # relative to base -> client/dist
+
+# SPA fallback: serve index.html for any route so React Router deep links
+# (e.g. /clients/123) don't 404 on refresh / direct visit.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
