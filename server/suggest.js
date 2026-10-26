@@ -10,6 +10,7 @@
 
 import { chatComplete, HAIKU } from './openrouter.js'
 import { fetchSiteSummary } from './brand.js'
+import { stripEmDashes } from './dashes.js'
 
 const PLATFORM_IDS = ['linkedin', 'instagram', 'substack', 'email', 'x']
 
@@ -30,6 +31,7 @@ Return STRICT JSON only, matching exactly:
     }
   ]
 }
+Never use em dashes (\u2014) in any field.
 No prose, no markdown, no commentary - just the JSON object.`
 
 function userPrompt({ topic, brand, platforms }) {
@@ -60,13 +62,15 @@ function sanitize(raw, platforms) {
   const arr = Array.isArray(raw?.ideas) ? raw.ideas : []
   return arr
     .map((it) => {
-      const title = typeof it?.title === 'string' ? it.title.trim() : ''
+      // Titles, descriptions and angles flow into post titles and briefs, so
+      // they get the same em-dash scrub as the post copy.
+      const title = typeof it?.title === 'string' ? stripEmDashes(it.title).trim() : ''
       if (!title) return null
       const platform = PLATFORM_IDS.includes(it?.platform) ? it.platform : fallbackPlatform
       const tags = Array.isArray(it?.tags)
         ? it.tags.map((t) => String(t ?? '').trim()).filter(Boolean).slice(0, 4)
         : []
-      let description = typeof it?.description === 'string' ? it.description.trim() : ''
+      let description = typeof it?.description === 'string' ? stripEmDashes(it.description).trim() : ''
       let sourceUrl = ''
       const rawSource = typeof it?.sourceUrl === 'string' ? it.sourceUrl.trim() : (typeof it?.source === 'string' ? it.source.trim() : '')
       if (rawSource) {
@@ -79,7 +83,7 @@ function sanitize(raw, platforms) {
       return {
         title: title.slice(0, 140),
         description,
-        angle: (typeof it?.angle === 'string' ? it.angle.trim() : '') || description.slice(0, 280),
+        angle: (typeof it?.angle === 'string' ? stripEmDashes(it.angle).trim() : '') || description.slice(0, 280),
         pillar: typeof it?.pillar === 'string' ? it.pillar.trim().slice(0, 80) : '',
         sourceUrl,
         tags,
@@ -358,7 +362,7 @@ export async function suggestStreamTopics(client = {}, { excludeTitles = [] } = 
     const seenUrl = new Set()
     const out = []
     for (const t of topics) {
-      const headline = String(t?.headline ?? t?.text ?? (typeof t === 'string' ? t : '')).trim()
+      const headline = stripEmDashes(String(t?.headline ?? t?.text ?? (typeof t === 'string' ? t : ''))).trim()
       if (!headline) continue
       const url = String(t?.url || '').trim()
       const info = url ? describeUrl(url) : null

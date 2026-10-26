@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os'
 import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { recordUsage } from './usage.js'
+import { stripEmDashes } from './dashes.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SKILL_TEMPLATES_DIR = join(__dirname, 'skills')
@@ -310,6 +311,7 @@ function brandManualSections(client, learnings = []) {
     "Match the brand voice EXACTLY — honour every DO and DON'T above and in content-rules.",
     'Ground every factual claim in the provided material. NEVER invent facts, stats, names, offers or links.',
     'NO hashtags anywhere in the copy — they are managed separately.',
+    'NO em dashes (\u2014) anywhere in the copy, and no spaced en dash (\u2013) in their place. Use a comma, colon, full stop or parentheses, or split the sentence.',
     "Write in the brand's language, never generic marketing filler.",
     'Commit to ONE concrete story angle or point of view — not a vague theme summary.',
     'BANNED filler (never use): "In today\'s fast-paced…", "Let\'s dive in", "game-changer", "unlock", "elevate your", "leverage", "synergy", "in a world where", "It\'s not just X, it\'s Y", "At the end of the day", "Here\'s the thing:", empty rhetorical questions as openers.',
@@ -375,14 +377,15 @@ async function runQuery(prompt, options) {
   return { text: result || lastAssistantText, reads, costUsd, usage }
 }
 
-// Strip a wrapping <post></post> (preferred) or ``` fence from the reply.
+// Strip a wrapping <post></post> (preferred) or ``` fence from the reply, then
+// scrub any em dashes the model used despite the hard rule.
 function cleanBody(text) {
   let t = String(text || '').trim()
   const tagged = t.match(/<post>\s*([\s\S]*?)\s*<\/post>/)
-  if (tagged) return tagged[1].trim()
+  if (tagged) return stripEmDashes(tagged[1].trim())
   const fence = t.match(/^```[a-z]*\n([\s\S]*?)\n```$/)
   if (fence) t = fence[1].trim()
-  return t
+  return stripEmDashes(t)
 }
 
 // The task instruction shared by both modes.

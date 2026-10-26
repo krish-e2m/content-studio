@@ -12,6 +12,7 @@
 
 import { isEngineEnabled, generateWithEngine, formatSpec } from './engine.js'
 import { chatComplete, HAIKU } from './openrouter.js'
+import { stripEmDashes } from './dashes.js'
 
 const PLATFORM_GUIDE = {
   linkedin: 'Professional but human. A strong point of view, short paragraphs, line breaks for readability.',
@@ -116,6 +117,7 @@ Rules:
 - Use the brand voice, rules, documents and learnings ONLY for tone, style, terminology and guardrails — they define HOW to write, never WHAT the post is about.
 - Match the brand voice, tone and point of view EXACTLY. Honour every DO and DON'T, never use the AVOID words, and weave brand keywords in naturally.
 - Apply the editorial learnings below without exception.
+- No em dashes (\u2014), and no spaced en dash (\u2013) in their place. Use a comma, colon, full stop or parentheses, or split the sentence.
 ${spec ? `- Format rules (follow EXACTLY — the length range is a hard requirement): ${spec}` : ''}
 Your reply must be ONLY the finished post copy — no preamble, no commentary, no markdown fences, no hashtags, no surrounding quotes.`
 
@@ -160,7 +162,8 @@ Your reply must be ONLY the finished post copy — no preamble, no commentary, n
 }
 
 // The model is told to reply with ONLY the post copy; strip a stray
-// <post></post> wrapper, code fence, or JSON {"body":…} envelope just in case.
+// <post></post> wrapper, code fence, or JSON {"body":…} envelope just in case,
+// then scrub any em dashes the model used despite the rule.
 function cleanCopy(text) {
   let t = String(text || '').trim()
   const tagged = t.match(/<post>\s*([\s\S]*?)\s*<\/post>/)
@@ -170,5 +173,5 @@ function cleanCopy(text) {
   if (/^\{[\s\S]*"body"\s*:/.test(t)) {
     try { const p = JSON.parse(t); if (typeof p.body === 'string') t = p.body.trim() } catch { /* leave as-is */ }
   }
-  return t
+  return stripEmDashes(t)
 }
