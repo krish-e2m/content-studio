@@ -27,14 +27,15 @@ function apiKey() {
   return k
 }
 
-// Run one chat-completions call. Returns { text, usage, cost, raw }. `plugins`
-// (e.g. the web-search plugin) enables OpenRouter's usage/cost reporting.
+// Run one chat-completions call. Returns { text, usage, cost, raw }. `tools`
+// carries OpenRouter server tools (e.g. openrouter:web_search), which run on
+// OpenRouter's side and come back as url_citation annotations on the message.
 //
 // Every call is tagged with the OpenRouter `user` field for the client it was
 // made for and its billed cost is written to the ai_usage ledger — see
 // server/usage.js. Both come from the request-scoped context, so callers pass
 // nothing; `feature` is only for the rare call made outside a request scope.
-export async function chatComplete({ model, messages, temperature = 0.7, maxTokens = 1200, responseFormat, plugins, timeoutMs = 90000, feature } = {}) {
+export async function chatComplete({ model, messages, temperature = 0.7, maxTokens = 1200, responseFormat, tools, timeoutMs = 90000, feature } = {}) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   const tag = usageTag()
@@ -60,7 +61,7 @@ export async function chatComplete({ model, messages, temperature = 0.7, maxToke
         // `user` dimension of its analytics API, which is how per-client spend
         // is answerable from their side and not only from our own ledger.
         ...(tag ? { user: tag } : {}),
-        ...(plugins ? { plugins } : {}),
+        ...(tools ? { tools } : {}),
         messages,
       }),
     })

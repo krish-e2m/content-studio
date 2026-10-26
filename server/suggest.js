@@ -1,7 +1,7 @@
 // Idea suggestions from a research topic. Two paths, both OpenRouter + Claude
 // Haiku 4.5 (no Groq):
 //
-//   • Web-grounded (preferred): Haiku 4.5 with OpenRouter's web-search plugin
+//   • Web-grounded (preferred): Haiku 4.5 with OpenRouter's web-search tool
 //     attached, so the ideas are grounded in the LATEST news/trends/stats.
 //   • Plain fallback (no web access): a single-turn Haiku call. The safety net
 //     whenever the web path errors or returns nothing.
@@ -102,7 +102,7 @@ function parseJsonBlock(text) {
   try { return JSON.parse(body.slice(start, end + 1)) } catch { return {} }
 }
 
-// --- OpenRouter + web-search plugin path --------------------------------------
+// --- OpenRouter + web-search tool path ----------------------------------------
 // Claude Haiku 4.5 with live search results attached does the 2-3 idea cards.
 // Override the model with SUGGEST_MODEL (any OpenRouter id) if ever needed —
 // e.g. SUGGEST_MODEL=openai/gpt-4o-mini for a cheaper stream/idea run.
@@ -112,6 +112,15 @@ export const STREAM_MAX = () => Math.max(1, Math.min(5, Number(process.env.STREA
 // How many live web results the stream pulls. Each result adds Exa cost + input
 // tokens, so lowering this is the simplest cost knob. Bounded 1..5, default 3.
 const STREAM_WEB_RESULTS = () => Math.max(1, Math.min(5, Number(process.env.STREAM_WEB_RESULTS) || 3))
+
+// OpenRouter's web search as a server tool. The older `plugins: [{ id: 'web' }]`
+// form is deprecated and now 404s for models without native search (e.g.
+// SUGGEST_MODEL=openai/gpt-4o-mini). The model may search more than once, so
+// max_total_results caps results across ALL its searches, not just per search.
+const webSearchTool = (n) => ({
+  type: 'openrouter:web_search',
+  parameters: { engine: 'exa', max_results: n, max_total_results: n },
+})
 
 // Rotating search angles: each refresh prioritises a couple of DIFFERENT facets
 // of the client's field so the query (and the sites it hits) changes, instead of
@@ -148,9 +157,9 @@ don't support.`
     temperature: 0.7,
     maxTokens: 1200,
     timeoutMs: 60000,
-    // web plugin: OpenRouter searches the topic and attaches the results. Exa
-    // engine + a low max_results cap keeps the search cost down.
-    plugins: [{ id: 'web', engine: 'exa', max_results: 3 }],
+    // OpenRouter searches the topic and hands the model the results. Exa
+    // engine + a low results cap keeps the search cost down.
+    tools: [webSearchTool(3)],
     messages: [
       { role: 'system', content: sys },
       { role: 'user', content: userPrompt({ topic, brand, platforms }) },
@@ -263,7 +272,7 @@ async function suggestStreamWithWeb({ profileText, searchFocus, angles = [], exc
     temperature: 0.5, // enough variety across refreshes; still grounded in results
     maxTokens: 700, // ~5 short headlines + urls — keep completion cheap
     timeoutMs: 60000,
-    plugins: [{ id: 'web', engine: 'exa', max_results: STREAM_WEB_RESULTS() }],
+    tools: [webSearchTool(STREAM_WEB_RESULTS())],
     messages: [
       { role: 'system', content: sys },
       // Lead with the search intent (industry/themes + this round's angles, NOT
