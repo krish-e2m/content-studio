@@ -117,24 +117,26 @@ function BrandBrainView({ client, onBack, onOpen, onSaved }) {
     const browserP = extractBrandSiteLive(url, (line) => setExtractLines((ls) => [...ls, line])).catch(() => null)
     const logoP = fetchLogo(url, base.ref.logo_scraped).then((r) => r.url).catch(() => '')
     const [groqData, browser, logoUrl] = await Promise.all([groqP, browserP, logoP])
-    if (!groqData && !browser) throw new Error('Could not read that website.')
+    // A browser run cut short by its time limit (slow host) can come back with
+    // nothing painted; it must not wipe the AI pass's colors with an empty set.
+    const b = browser?.branding?.colors?.all?.length ? browser.branding : null
+    if (!groqData && !b) throw new Error('Could not read that website.')
 
     let nextRef = base.ref
     if (groqData) nextRef = mergeExtraction(nextRef, groqData, url)
 
-    if (browser?.branding) {
+    if (b) {
       // browser owns colors/fonts/positioning; logo comes from manifest.im
-      nextRef = applyBrowserBranding(nextRef, browser.branding, url, logoUrl)
+      nextRef = applyBrowserBranding(nextRef, b, url, logoUrl)
     } else if (logoUrl) {
       // no visual branding this run, but keep the manifest logo we fetched
       nextRef = { ...nextRef, logo_scraped: logoUrl }
     }
 
-    const b = browser?.branding
     const pages = b?.pages_crawled?.length || (b ? 1 : 0)
     const msg = [
       b ? `${pages} page${pages === 1 ? '' : 's'} painted` : null,
-      b ? `${b.colors?.all?.length || 0} colors` : null,
+      b ? `${b.colors?.all?.length || 0} colors` : 'colors skipped',
       logoUrl ? 'logo captured' : null,
       groqData ? 'voice drafted' : 'voice skipped',
     ].filter(Boolean).join(' · ')

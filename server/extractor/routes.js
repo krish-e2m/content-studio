@@ -38,6 +38,11 @@ const jobs = new Map()
 // so this only needs to cover any in-flight /api/files reads. Configurable.
 const CLEANUP_DELAY_MS = Number(process.env.EXTRACTION_TTL_MS) || 60_000
 
+// Backstop for a job that never finishes. The engine stops itself at its own
+// time budget (EXTRACT_BUDGET_MS) + 30s; this fires a minute after that, so it
+// only ever catches a wedged browser. SIGTERM lets puppeteer close Chromium.
+const JOB_TIMEOUT_MS = Number(process.env.EXTRACT_JOB_TIMEOUT_MS) || (Number(process.env.EXTRACT_BUDGET_MS) || 90_000) + 90_000
+
 // Remove a job's on-disk folder and drop it from the in-memory Map. Safe to
 // call more than once (force:true ignores an already-gone dir).
 async function removeExtraction(jobId) {
@@ -112,6 +117,14 @@ router.post('/api/extract', async (req, res) => {
     env: process.env,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
+  const killTimer = setTimeout(() => {
+    if (job.status !== 'running') return
+    job.timedOut = true
+    console.error(`[extract] ${jobId} still running after ${JOB_TIMEOUT_MS / 1000}s - stopping it`)
+    child.kill('SIGTERM')
+    setTimeout(() => { try { child.kill('SIGKILL') } catch {} }, 5000).unref()
+  }, JOB_TIMEOUT_MS)
+  killTimer.unref()
 
   // parse stdout line-by-line; strip the "[branding] " prefix; fan out to SSE
   let buf = ''
@@ -142,6 +155,7 @@ router.post('/api/extract', async (req, res) => {
   })
 
   child.on('close', async (code) => {
+    clearTimeout(killTimer)
     if (code === 0) {
       try {
         const raw = await fs.readFile(path.join(outDir, 'branding.json'), 'utf8')
@@ -155,7 +169,9 @@ router.post('/api/extract', async (req, res) => {
       }
     } else {
       job.status = 'error'
-      job.error = `extractor exited with code ${code}`
+      job.error = job.timedOut
+        ? `brand extraction took longer than ${Math.round(JOB_TIMEOUT_MS / 1000)}s on this server and was stopped`
+        : `extractor exited with code ${code}`
       broadcast(job, { type: 'error', error: job.error })
     }
     for (const r of job.listeners) { try { r.end() } catch {} }

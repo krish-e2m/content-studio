@@ -35,7 +35,35 @@ const ORIGIN = new URL(START_URL).origin
 const MAX_PAGES = 6 // homepage + up to 5 crawled
 const DESKTOP = { width: 1440, height: 900 }
 const MOBILE = { width: 390, height: 844 }
-const NAV_TIMEOUT = 60000
+const NAV_TIMEOUT = 30000
+// How long to wait for the network to go quiet (networkidle2) before reading a
+// page that is still busy (chat widgets, polling, a slow host) as it is.
+const IDLE_MS = 20000
+
+// Time budget for the whole run. A small host (e.g. Render's 0.1-CPU free
+// instance) renders pages many times slower than a laptop, and an unbounded
+// crawl there just looks frozen. Past the budget no more pages are visited;
+// at the hard limit the browser is closed and whatever was collected is saved.
+const BUDGET_MS = Number(process.env.EXTRACT_BUDGET_MS) || 90000
+const HARD_LIMIT_MS = BUDGET_MS + 30000
+const STARTED = Date.now()
+const timeLeft = () => BUDGET_MS - (Date.now() - STARTED)
+const STEP_MS = 15000 // rough cost of one more page on a slow host
+let stopped = false // set at the hard limit; no more navigation after that
+
+// Third-party trackers, chat widgets and video say nothing about the brand but
+// keep the network busy and the CPU pegged, which on a small host is the
+// difference between a quick load and a timed-out one.
+const BLOCKED_URLS = [
+  'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'googleadservices.com',
+  'googlesyndication.com', 'facebook.net', 'hotjar.com', 'clarity.ms', 'hs-scripts.com',
+  'hs-analytics.net', 'hsadspixel.net', 'hs-banner.com', 'hsforms', 'usemessages.com',
+  'intercom.io', 'intercomcdn.com', 'drift.com', 'crisp.chat', 'tawk.to', 'zdassets.com',
+  'livechatinc.com', 'leadconnectorhq.com', 'msgsndr.com', 'snap.licdn.com', 'ads.linkedin.com',
+  'bat.bing.com', 'ads-twitter.com', 'analytics.tiktok.com', 'segment.com', 'segment.io',
+  'mixpanel.com', 'amplitude.com', 'fullstory.com', 'mouseflow.com', 'crazyegg.com',
+  'analytics.ahrefs.com', 'challenges.cloudflare.com', 'youtube.com/embed', 'player.vimeo.com',
+].map((h) => `*${h}*`).concat(['*.mp4*', '*.webm*', '*.m3u8*', '*.mov*'])
 
 const PRIORITY = [
   'about', 'services', 'product', 'pricing', 'contact', 'team',
@@ -83,6 +111,11 @@ const LAUNCH_ARGS = [
   '--no-first-run',
   '--mute-audio',
   '--disable-extensions',
+  // nothing in the background competing for a small host's CPU / memory
+  '--disable-background-networking',
+  '--disable-component-update',
+  '--disable-default-apps',
+  '--disable-sync',
 ]
 
 async function launchBrowser() {
@@ -91,6 +124,9 @@ async function launchBrowser() {
   return puppeteer.launch({
     headless: 'new',
     executablePath,
+    // Over a pipe, Chromium exits by itself when this process dies (even on
+    // SIGKILL); over a WebSocket it would be orphaned and hold its memory.
+    pipe: true,
     args: LAUNCH_ARGS,
     protocolTimeout: 60000,
     defaultViewport: DESKTOP,
@@ -116,6 +152,14 @@ async function preparePage(page) {
     'sec-ch-ua-platform': '"macOS"',
   })
   page.setDefaultNavigationTimeout(NAV_TIMEOUT)
+  // Blocked through a separate DevTools session rather than request
+  // interception, which would also switch off the HTTP cache the crawled pages
+  // share their CSS / JS through.
+  try {
+    const cdp = await page.createCDPSession()
+    await cdp.send('Network.enable')
+    await cdp.send('Network.setBlockedURLs', { urls: BLOCKED_URLS })
+  } catch (e) { warn(`tracker blocking unavailable: ${e.message}`) }
 }
 
 // -----------------------------------------------------------------------------
@@ -126,8 +170,9 @@ let browser = null
 let page = null
 
 async function ensureBrowser() {
+  if (stopped) throw new Error('time limit reached')
   if (browser && browser.connected && page && !page.isClosed()) return page
-  warn('browser not healthy - (re)launching')
+  warn(browser ? 'browser not healthy - relaunching' : 'starting the browser')
   try { if (browser) await browser.close() } catch {}
   browser = await launchBrowser()
   page = await browser.newPage()
@@ -135,22 +180,30 @@ async function ensureBrowser() {
   return page
 }
 
-// Navigate with networkidle2 → domcontentloaded fallback, plus a few retries to
-// confirm a live page context. Relaunches the browser if it crashed.
+// Wait for networkidle2 for a capped time. If the page is still busy after
+// that, keep the load already under way and read the page as soon as its DOM
+// is parsed (a slow host used to time out here and then load the whole page a
+// second time). Retries once, relaunching the browser if it crashed.
 async function navigate(url) {
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const p = await ensureBrowser()
+      // mark the current document, so a load that has not committed yet can't
+      // be mistaken for the new page
+      await p.evaluate(() => { window.__brandingPrevDoc = true }).catch(() => {})
+      const idle = Math.max(5000, Math.min(IDLE_MS, timeLeft() / 3))
       try {
-        await p.goto(url, { waitUntil: 'networkidle2', timeout: NAV_TIMEOUT })
-      } catch {
-        warn('networkidle2 timed out - retrying with domcontentloaded')
-        await p.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT })
+        await p.goto(url, { waitUntil: 'networkidle2', timeout: idle })
+      } catch (e) {
+        if (!/timeout/i.test(e.message)) throw e
+        await p.waitForFunction(() => !window.__brandingPrevDoc && document.readyState !== 'loading', { timeout: NAV_TIMEOUT })
+        warn(`page still busy after ${Math.round(idle / 1000)}s - reading it as it is`)
       }
       // confirm a live, evaluable context
       await p.evaluate(() => document.readyState)
       return p
     } catch (e) {
+      if (stopped) throw e
       warn(`navigation attempt ${attempt} failed: ${e.message}`)
       // force a relaunch on the next ensureBrowser()
       try { if (browser) await browser.close() } catch {}
@@ -741,7 +794,7 @@ async function download(url, destAbs) {
       await fs.writeFile(destAbs, buf)
       return true
     }
-    const r = await fetch(url, { headers: { 'user-agent': UA, Referer: ORIGIN }, redirect: 'follow' })
+    const r = await fetch(url, { headers: { 'user-agent': UA, Referer: ORIGIN }, redirect: 'follow', signal: AbortSignal.timeout(10000) })
     if (!r.ok) return false
     const buf = Buffer.from(await r.arrayBuffer())
     if (!buf.length) return false
@@ -766,8 +819,13 @@ function buildQa(checks) {
 async function runQa(branding) {
   const checks = []
   const add = (name, status, message) => checks.push({ name, status, message })
+  // Reloading the homepage only pays off when there is something to retry,
+  // and only when the time budget still allows a page load.
+  const needsRetry = !branding.logo || !branding.typography.fonts_used.length || branding.design_tokens.buttons.length < 2
   let p
   try {
+    if (!needsRetry) throw new Error('nothing to retry')
+    if (timeLeft() < STEP_MS) throw new Error('no time left to retry')
     p = await navigate(START_URL)
     await dismissCookieBanner(p)
   } catch {
@@ -901,6 +959,22 @@ async function main() {
     } catch (e) { warn(`clean html ${name}: ${e.message}`) }
   }
 
+  // Hard stop: closing the browser makes every pending page call fail, so the
+  // run falls through to `finally` and still writes what it has.
+  const hardStop = setTimeout(() => {
+    stopped = true
+    warn(`time limit (${Math.round(HARD_LIMIT_MS / 1000)}s) reached - saving what was collected`)
+    browser?.close().catch(() => {})
+  }, HARD_LIMIT_MS)
+  // The server sends SIGTERM when it gives up on the job. Puppeteer closes the
+  // browser on that signal but leaves this process running, which used to
+  // relaunch Chromium; mark the run stopped so it finishes instead.
+  process.once('SIGTERM', () => {
+    stopped = true
+    warn('stop requested - saving what was collected')
+    browser?.close().catch(() => {})
+  })
+
   try {
     log(`extracting branding for ${START_URL}`)
     let p = await navigate(START_URL)
@@ -991,7 +1065,11 @@ async function main() {
     const toVisit = scored.slice(0, MAX_PAGES - 1)
     log(`crawling ${toVisit.length} more page(s): ${toVisit.map((c) => c.path).join(', ') || '(none)'}`)
 
-    for (const cand of toVisit) {
+    for (const [i, cand] of toVisit.entries()) {
+      if (timeLeft() < STEP_MS) {
+        warn(`time budget reached - skipping the remaining ${toVisit.length - i} page(s)`)
+        break
+      }
       const slug = cand.path.replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '')
       const name = uniqueName(slug)
       try {
@@ -999,7 +1077,9 @@ async function main() {
         const cp = await navigate(cand.href)
         await dismissCookieBanner(cp)
         perPageColors.push({ name, ...(await cp.evaluate(samplePageColors)) })
-        await capturePage(cp, name, cand.path)
+        // screenshots + HTML are extras (the app reads colors / fonts / meta);
+        // drop them first when time is short
+        if (timeLeft() > STEP_MS * 2) await capturePage(cp, name, cand.path)
         branding.pages_crawled.push(cand.path)
       } catch (e) {
         warn(`page ${cand.path} failed (continuing): ${e.message}`)
@@ -1021,6 +1101,7 @@ async function main() {
       try { branding.qa = await runQa(branding) } catch { branding.qa = buildQa([{ name: 'Run', status: 'fail', message: e.message }]) }
     }
   } finally {
+    clearTimeout(hardStop)
     try { if (browser) await browser.close() } catch {}
     await fs.writeFile(path.join(OUT_DIR, 'branding.json'), JSON.stringify(branding, null, 2))
     log(`wrote branding.json (qa score ${branding.qa?.score ?? 'n/a'})`)

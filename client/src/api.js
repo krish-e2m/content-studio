@@ -416,14 +416,18 @@ export async function extractBrandSiteLive(url, onProgress) {
   const branding = await new Promise((resolve, reject) => {
     const es = new EventSource(`${BASE}/api/status/${jobId}`)
     let settled = false
+    const finish = (fn, arg) => { if (settled) return; settled = true; clearTimeout(timer); es.close(); fn(arg) }
+    // The server stops a stuck job itself; this only guards against the stream
+    // going quiet, so the Brand Brain loader can never wait forever.
+    const timer = setTimeout(() => finish(reject, new Error('The brand extractor took too long')), 4 * 60 * 1000)
     es.onmessage = (ev) => {
       let msg
       try { msg = JSON.parse(ev.data) } catch { return }
       if (msg.type === 'progress') onProgress?.(msg.message)
-      else if (msg.type === 'complete') { settled = true; es.close(); resolve(msg.result) }
-      else if (msg.type === 'error') { settled = true; es.close(); reject(new Error(msg.error || 'Extraction failed')) }
+      else if (msg.type === 'complete') finish(resolve, msg.result)
+      else if (msg.type === 'error') finish(reject, new Error(msg.error || 'Extraction failed'))
     }
-    es.onerror = () => { if (!settled) { es.close(); reject(new Error('Lost connection to the extractor')) } }
+    es.onerror = () => finish(reject, new Error('Lost connection to the extractor'))
   })
   return { jobId, branding }
 }
