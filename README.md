@@ -158,3 +158,9 @@ To deploy on **Render**:
 2. Create a new **Web Service**, select **Docker** environment, and pick the **Free** instance.
 3. Add your `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_ANON_KEY`, and `PORT=4000` environment variables.
 4. Deploy!
+
+### Daily Stream Refresh (cron)
+[`.github/workflows/stream-refresh.yml`](.github/workflows/stream-refresh.yml) calls `POST /api/cron/stream-refresh` once a day (06:00 UTC) to pull fresh Stream topics for every client. To enable it:
+1. Set `CRON_SECRET` (any long random string, e.g. `openssl rand -hex 32`) in the Render environment.
+2. In GitHub, go to **Settings > Secrets and variables > Actions** and add `API_URL` (the deployed base URL) and `CRON_SECRET` (the same value).
+3. Trigger it by hand any time from **Actions > Daily stream refresh > Run workflow** (optionally for a single `clientId`).

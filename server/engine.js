@@ -410,6 +410,11 @@ function taskPrompt({ platform, format, topic, note, pillar, angle }, closing) {
 // =============================================================================
 // LEAN mode — one call, everything inlined, no tools/loop/preset.
 // =============================================================================
+
+// Models whose endpoint rejects thinking: disabled ("Reasoning is mandatory").
+// Learned on the first refusal, so later posts skip the failed attempt.
+const REASONING_REQUIRED = new Set()
+const isReasoningRequired = (e) => /reasoning is mandatory/i.test(e?.message || '')
 function buildLeanSystem(client, learnings, { inline, skipped, skillText, platform }) {
   const L = []
   L.push(`# ${client.name || 'Brand'} — Brand Brain`, '')
@@ -470,18 +475,30 @@ async function generateLean({ topic, note, platform, format, client, learnings =
   const system = buildLeanSystem(client, learnings, { inline, skipped, skillText, platform })
   const prompt = taskPrompt({ platform, format, topic, note, pillar, angle }, 'Everything you need is in the system prompt above.')
 
-  const { text, costUsd, usage } = await runQuery(prompt, {
+  const options = {
     model,
     systemPrompt: system, // plain string → NO claude_code preset
     settingSources: [], // don't load anything from disk
     allowedTools: [],
     disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'Task', 'Skill'],
     maxTurns: 1,
-    // short social posts don't need extended reasoning — disabling thinking cuts
-    // the biggest cost (thinking is billed as output tokens). The whole brand
-    // brain is already in the prompt, so the model just writes.
-    thinking: { type: 'disabled' },
-  })
+  }
+  // short social posts don't need extended reasoning — disabling thinking cuts
+  // the biggest cost (thinking is billed as output tokens). The whole brand
+  // brain is already in the prompt, so the model just writes.
+  // Some models (e.g. claude-sonnet-5.5) refuse to run with thinking off; those
+  // get adaptive thinking instead, which only spends what the post needs.
+  const thinking = REASONING_REQUIRED.has(model) ? { type: 'adaptive' } : { type: 'disabled' }
+  let result
+  try {
+    result = await runQuery(prompt, { ...options, thinking })
+  } catch (e) {
+    if (thinking.type !== 'disabled' || !isReasoningRequired(e)) throw e
+    REASONING_REQUIRED.add(model)
+    console.warn(`[engine] ${model} requires reasoning; using adaptive thinking from now on`)
+    result = await runQuery(prompt, { ...options, thinking: { type: 'adaptive' } })
+  }
+  const { text, costUsd, usage } = result
 
   // Prefer the cost we compute from real token usage (accurate for the model
   // actually billed); fall back to the SDK's figure only when we have no rate.

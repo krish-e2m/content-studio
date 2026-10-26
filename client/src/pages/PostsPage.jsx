@@ -13,9 +13,11 @@ const STATUSES = ['draft', 'scheduled', 'published']
 const PAGE_SIZES = [10, 25, 50]
 const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-')
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : '')
+// scheduled_at comes back as a full timestamp ("2026-10-26T14:30:00"); only the
+// date part is shown here, so drop the time before parsing.
 const fmtDate = (iso) => {
   if (!iso) return '-'
-  try { return new Date(iso + 'T00:00:00').toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) }
+  try { return new Date(String(iso).slice(0, 10) + 'T00:00:00').toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) }
   catch { return iso }
 }
 
@@ -119,7 +121,8 @@ export default function PostsPage() {
       content: p.content || '',
       format: p.format || '',
       status: p.status || 'scheduled',
-      scheduledAt: p.scheduledAt || '',
+      // DatePicker speaks YYYY-MM-DD; the time of day is restored on save
+      scheduledAt: (p.scheduledAt || '').slice(0, 10),
       tags: (p.tags || []).join(', '),
       imagePaths: p.imagePaths || [],
     })
@@ -144,7 +147,8 @@ export default function PostsPage() {
         content: editForm.content,
         format: editForm.format,
         status: editForm.status,
-        scheduledAt: editForm.scheduledAt || null,
+        // keep any time of day set on the Calendar, as its drag-to-reschedule does
+        scheduledAt: editForm.scheduledAt ? editForm.scheduledAt + String(editPost.scheduledAt || '').slice(10) : null,
         tags: [...new Set(editForm.tags.split(',').map((t) => t.trim().toUpperCase()).filter(Boolean))],
         imagePaths: editForm.imagePaths,
       })

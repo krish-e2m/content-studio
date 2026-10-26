@@ -121,19 +121,30 @@ alter table public.research_topics enable row level security;
 -- ---------------------------------------------------------------------------
 -- 6. POSTS TABLE
 -- ---------------------------------------------------------------------------
+-- One row per platform; the rows of one Create session share a batch_id. These
+-- are the columns server/index.js (toPostRow) reads and writes.
 create table if not exists public.posts (
   id            uuid primary key default gen_random_uuid(),
   client_id     uuid not null references public.clients (id) on delete cascade,
-  idea_id       uuid references public.ideas (id) on delete set null,
+  batch_id      uuid,
+  platform      text not null default '',
+  title         text not null default '',
+  content       text not null default '',
+  note          text not null default '',
+  format        text not null default '',
+  tags          text[] not null default '{}',
+  image_paths   text[] not null default '{}',
+  image_prompt  text not null default '',
+  -- wall-clock date/time as picked in the UI ("2026-10-26" or "2026-10-26T14:30")
+  scheduled_at  timestamp,
   status        text not null default 'draft'
                   check (status in ('draft', 'scheduled', 'published')),
-  state         jsonb not null default '{}'::jsonb,
   created_at    timestamptz not null default now(),
   updated_at    timestamptz not null default now()
 );
 
 create index if not exists posts_client_id_idx on public.posts (client_id);
-create index if not exists posts_idea_id_idx on public.posts (idea_id);
+create index if not exists posts_batch_id_idx on public.posts (client_id, batch_id);
 create index if not exists posts_status_idx on public.posts (client_id, status);
 create index if not exists posts_updated_at_idx on public.posts (client_id, updated_at desc);
 

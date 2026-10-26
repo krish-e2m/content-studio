@@ -30,7 +30,8 @@ export const addDays = (d, n) => {
   return x
 }
 export const prettyDate = (isoStr) => {
-  const [, m, dd] = isoStr.split('-').map(Number)
+  // date part only: a scheduled_at timestamp carries a "T14:30:00" tail
+  const [, m, dd] = String(isoStr).slice(0, 10).split('-').map(Number)
   return { d: dd, m: MONTHS[m - 1].slice(0, 3) }
 }
 
