@@ -158,6 +158,31 @@ export function documentsToGuidelines(documents) {
   return out
 }
 
+// Remove colour guidance from a markdown brand doc, for when the studio's
+// "Use on-brand colors" toggle is off. Drops whole sections whose heading names
+// a colour or palette (core/brand-design keeps its colour rule inside those
+// sections), plus any other line that carries a hex / rgb / hsl value. The rest
+// of the doc (voice, typography, wordmark) still guides the image.
+const COLOR_HEADING = /colou?r|palette/i
+const COLOR_VALUE = /#[0-9a-f]{3,8}\b|\b(?:rgb|hsl)a?\(/i
+export function stripColorGuidance(markdown) {
+  const out = []
+  let dropLevel = 0 // depth of the colour section being dropped; 0 = keeping lines
+  for (const line of String(markdown || '').split('\n')) {
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line)
+    if (heading) {
+      const level = heading[1].length
+      if (dropLevel && level > dropLevel) continue // sub-heading of a dropped section
+      dropLevel = COLOR_HEADING.test(heading[2]) ? level : 0
+      if (dropLevel) continue
+    } else if (dropLevel || COLOR_VALUE.test(line)) {
+      continue
+    }
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
 const clampInt = (v, lo, hi, dflt) => {
   const n = Math.round(Number(v))
   return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : dflt
@@ -175,10 +200,15 @@ const clampInt = (v, lo, hi, dflt) => {
 //   — Palette is assigned by design role (bg / text / accent), not "soft" vs "strict"
 //   — The prompt is layered: structural core (always) + default look (only when
 //     the user names no style) + palette roles (only when brandColors exist)
-export function buildPrompt({ prompt, style, composition, lighting, aspect, brandColors, guidelines, avoid, logo, hasReferences, hasLogoImage }) {
+export function buildPrompt({ prompt, style, composition, lighting, aspect, brandColors, brandColorsOff, guidelines, avoid, logo, hasReferences, hasLogoImage }) {
   const parts = []
   const userText = String(prompt || '').trim()
   const isText = TEXT_STYLES.has(style)
+  // Toggle off: colour values are already stripped from the guidelines, but a
+  // colour can still be named in prose ("wordmark in Acme Red"), so say it outright.
+  const colorsOffClause = brandColorsOff
+    ? `Brand colors are switched off for this image: do not steer the colors toward the brand's palette or any color named in the brand guidelines; use whatever colors suit the subject naturally.${hasLogoImage ? ' The attached brand logo keeps its original colors.' : ''}`
+    : ''
 
   // ── TEXT-FIRST BRANCH (infographic) ────────────────────────────────────
   if (isText) {
@@ -229,6 +259,7 @@ export function buildPrompt({ prompt, style, composition, lighting, aspect, bran
     if (guide) {
       parts.push(`Follow these brand and visual guidelines wherever visually relevant: ${guide}`)
     }
+    if (colorsOffClause) parts.push(colorsOffClause)
 
     // Logo — same logic as photo styles
     if (logo === true && hasLogoImage) {
@@ -311,6 +342,7 @@ export function buildPrompt({ prompt, style, composition, lighting, aspect, bran
   if (guide) {
     parts.push(`Follow these brand and visual guidelines wherever visually relevant: ${guide}`)
   }
+  if (colorsOffClause) parts.push(colorsOffClause)
 
   // Quality / clarity clause — always push for a sharp, usable social asset.
   const isPhoto = PHOTO_STYLES.has(style)
@@ -530,6 +562,7 @@ export async function generateImages({
   lighting = 'auto',
   aspect = 'square',
   brandColors = [],
+  useBrandColors,
   documents = [],
   avoid = '',
   logo,
@@ -537,6 +570,16 @@ export async function generateImages({
   references = [],
   count = 1,
 } = {}) {
+  // The studio's "Use on-brand colors" toggle. Off means no palette AND no
+  // colour guidance smuggled in through the auto-attached brand docs.
+  // (undefined = an older caller; keep the previous behaviour.)
+  const colorsOff = useBrandColors === false
+  if (colorsOff) {
+    brandColors = []
+    documents = (Array.isArray(documents) ? documents : []).map((d) =>
+      d && typeof d.content === 'string' ? { ...d, content: stripColorGuidance(d.content) } : d,
+    )
+  }
   const key = process.env.OPENROUTER_API_KEY
   if (!key) throw new Error('OPENROUTER_API_KEY is not set in the .env file')
 
@@ -562,6 +605,7 @@ export async function generateImages({
     lighting,
     aspect,
     brandColors,
+    brandColorsOff: colorsOff,
     guidelines: documentsToGuidelines(documents),
     avoid,
     logo: typeof logo === 'boolean' ? logo : undefined,
@@ -596,6 +640,7 @@ export async function generateImages({
     aspect: aspect || 'square',
     count: n,
     brandColors: palette,
+    brandColorsOff: colorsOff,
     logo: logo === true,
     logoAttached: !!logoRef,
     references: refs.length,

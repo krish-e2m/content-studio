@@ -29,12 +29,20 @@ const pathKey = (u) => {
   try { return new URL(u).pathname.replace(/\/+$/, '') || '/' } catch { return u }
 }
 
-// Fetch + parse one HTML page → { url, title, text, css, links[], cssUrls[] } or null.
+// example.com and www.example.com are the same site: sites redirect freely
+// between the two, and a crawl started on one must follow links to the other.
+const siteOf = (u) => {
+  try { return new URL(u).hostname.replace(/^www\./i, '').toLowerCase() } catch { return '' }
+}
+
+// Fetch + parse one HTML page → { url, finalUrl, title, text, css, links[], cssUrls[] } or null.
 async function fetchPage(url, origin) {
   let html
+  let finalUrl = url
   try {
     const r = await fetchWithTimeout(url)
     if (!r.ok || !(r.headers.get('content-type') || '').includes('text/html')) return null
+    finalUrl = r.url || url // after redirects
     html = await r.text()
   } catch {
     return null
@@ -58,16 +66,16 @@ async function fetchPage(url, origin) {
   const links = []
   $('a[href]').each((_, el) => {
     try {
-      const abs = new URL($(el).attr('href'), url)
-      if (abs.origin === origin && /^https?:$/.test(abs.protocol)) links.push(abs.href)
+      const abs = new URL($(el).attr('href'), finalUrl)
+      if (siteOf(abs.href) === siteOf(origin) && /^https?:$/.test(abs.protocol)) links.push(abs.href)
     } catch {}
   })
   const cssUrls = []
   $('link[rel="stylesheet"]').each((_, el) => {
     const href = $(el).attr('href')
-    if (href) { try { cssUrls.push(new URL(href, url).href) } catch {} }
+    if (href) { try { cssUrls.push(new URL(href, finalUrl).href) } catch {} }
   })
-  return { url, title, text, css: `${inlineCss}\n${styleAttrs}`, links, cssUrls }
+  return { url, finalUrl, title, text, css: `${inlineCss}\n${styleAttrs}`, links, cssUrls }
 }
 
 // Light, single-page read of a site's homepage → title + meta + visible text,
@@ -87,74 +95,111 @@ export async function fetchSiteSummary(url, maxChars = 1200) {
   }
 }
 
+// Child sitemaps that list company pages come before blog / archive ones.
+const sitemapRank = (loc) =>
+  /page/i.test(loc) ? 0 : /(post|blog|news|article|faq|author|category|tag)/i.test(loc) ? 2 : 1
+
 // Pull every URL listed in sitemap.xml / sitemap_index.xml (one level of nesting).
 async function discoverFromSitemap(origin) {
   const out = new Set()
-  let nested = 0
+  const nested = []
   const grab = (xml) => [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)].map((m) => m[1])
   for (const sm of [`${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`]) {
     try {
       const r = await fetchWithTimeout(sm)
       if (!r.ok) continue
       for (const loc of grab(await r.text())) {
-        if (/\.xml(\?|$)/i.test(loc)) {
-          if (out.size > 200 || nested >= 10) continue // cap nested sitemap fetches
-          nested++
-          try {
-            const rr = await fetchWithTimeout(loc)
-            if (rr.ok) grab(await rr.text()).forEach((u) => out.add(u))
-          } catch {}
-        } else {
-          out.add(loc)
-        }
+        if (/\.xml(\?|$)/i.test(loc)) nested.push(loc)
+        else out.add(loc)
       }
     } catch {}
   }
+  // An index lists its children in no useful order (WordPress puts the blog's
+  // post-sitemap first), so read page sitemaps first and cap each child, or a
+  // big blog fills the URL budget before the company pages are ever seen.
+  const children = [...new Set(nested)].sort((a, b) => sitemapRank(a) - sitemapRank(b)).slice(0, 10)
+  const lists = await Promise.all(children.map(async (loc) => {
+    try {
+      const r = await fetchWithTimeout(loc)
+      return r.ok ? grab(await r.text()).slice(0, 100) : []
+    } catch { return [] }
+  }))
+  lists.flat().forEach((u) => out.add(u))
   return [...out]
+}
+
+// How much a page says about the BRAND rather than one article's topic; lower
+// is better. About/company pages first, then what they sell, then other
+// shallow pages. Blog posts, FAQs and archive listings go last.
+const ABOUT_PAGE = /\b(about|company|team|leadership|story|mission|values|why)\b/i
+const COMPANY_PAGE = /\b(services?|solutions?|pricing|plans?|work|case-stud\w*|portfolio|products?|features?|how-it-works|clients|partners?)\b/i
+const ARTICLE_PAGE = /\/(blog|news|articles?|posts?|insights|faqs?|guides?|author|category|tag|topics?)(\/|$)|\/page\/\d+|\/\d{4}\/\d{2}\//i
+const ARTICLE_PAGES = 4 // a few posts still help the voice samples
+const ARTICLE_RANK = 4
+function pageRank(u) {
+  const path = pathKey(u)
+  const shallow = path.split('/').filter(Boolean).length <= 1
+  if (ARTICLE_PAGE.test(path)) return ARTICLE_RANK
+  if (ABOUT_PAGE.test(path)) return 0
+  if (COMPANY_PAGE.test(path)) return shallow ? 1 : 2
+  return shallow ? 2 : 3
 }
 
 const isAsset = (pathname) =>
   /\.(pdf|jpe?g|png|gif|svg|webp|ico|zip|mp4|mov|css|js|xml|json|txt|woff2?)(\?|$)/i.test(pathname)
 
 async function crawlSite(startUrl, maxPages = MAX_PAGES) {
-  const startOrigin = new URL(startUrl).origin
-
   // 1) homepage (gives links + content; may be a sparse SPA shell)
-  const home = await fetchPage(startUrl, startOrigin)
+  const home = await fetchPage(startUrl, new URL(startUrl).origin)
+  // Crawl from wherever the homepage actually lives: a bare domain usually
+  // redirects to www (or the reverse), and the sitemap only answers there.
+  const startOrigin = new URL(home?.finalUrl || startUrl).origin
 
   // 2) sitemap. Sites sometimes host their real content on a sister domain
   //    (e.g. a .ca SPA whose sitemap points at the .com), so we TRUST whatever
-  //    origins the sitemap declares - not just the start origin.
+  //    sites the sitemap declares - not just the start one.
   const sitemap = await discoverFromSitemap(startOrigin)
-  const allowed = new Set([startOrigin])
-  for (const u of sitemap) { try { allowed.add(new URL(u).origin) } catch {} }
+  const allowed = new Set([siteOf(startOrigin)])
+  for (const u of sitemap) allowed.add(siteOf(u))
 
   const seen = new Set()
-  const key = (u) => `${new URL(u).origin}${pathKey(u)}`
-  if (home) seen.add(key(startUrl))
+  const key = (u) => `${siteOf(u)}${pathKey(u)}`
+  if (home) seen.add(key(home.finalUrl))
 
-  // sitemap first (authoritative), then homepage links, then common-path guesses
+  // homepage links first (the site's own pick of its key pages), then the
+  // sitemap (complete), then common-path guesses. pageRank reorders below;
+  // this order only breaks ties.
   const candidates = []
-  const pool = [...sitemap, ...(home?.links || []), ...COMMON_PATHS.map((p) => startOrigin + p)]
+  const pool = [...(home?.links || []), ...sitemap, ...COMMON_PATHS.map((p) => startOrigin + p)]
   for (const u of pool) {
     let abs
     try { abs = new URL(u, startUrl) } catch { continue }
-    if (!allowed.has(abs.origin) || isAsset(abs.pathname)) continue
+    if (!allowed.has(siteOf(abs.href)) || isAsset(abs.pathname)) continue
     const k = key(abs.href)
     if (seen.has(k)) continue
     seen.add(k)
     candidates.push(abs.href)
   }
 
-  // 3) fetch candidates concurrently in small batches until we hit maxPages
+  // 3) fetch candidates concurrently in small batches until we hit maxPages.
+  //    Brand pages first; a few articles are slotted in before the overscan
+  //    tail so they are actually reached.
   const pages = home ? [home] : []
   const cssUrls = new Set(home?.cssUrls || [])
-  const toFetch = candidates.slice(0, Math.max(1, maxPages - pages.length) * 2) // overscan; some 404
+  const ranked = candidates.map((u, i) => ({ u, i, r: pageRank(u) })).sort((a, b) => a.r - b.r || a.i - b.i)
+  const company = ranked.filter((c) => c.r < ARTICLE_RANK).map((c) => c.u)
+  const articles = ranked.filter((c) => c.r === ARTICLE_RANK).slice(0, ARTICLE_PAGES).map((c) => c.u)
+  const want = Math.max(1, maxPages - pages.length)
+  const head = Math.max(0, want - articles.length)
+  const toFetch = [...company.slice(0, head), ...articles, ...company.slice(head)].slice(0, want * 2) // overscan; some 404
   const batch = 6
+  // guessed paths like /about and /about-us often redirect to the same page
+  const landed = new Set(home ? [key(home.finalUrl)] : [])
   for (let i = 0; i < toFetch.length && pages.length < maxPages; i += batch) {
     const results = await Promise.all(toFetch.slice(i, i + batch).map((u) => fetchPage(u, new URL(u).origin)))
     for (const p of results) {
-      if (p && pages.length < maxPages) {
+      if (p && pages.length < maxPages && !landed.has(key(p.finalUrl))) {
+        landed.add(key(p.finalUrl))
         pages.push(p)
         p.cssUrls.forEach((c) => cssUrls.add(c))
       }
@@ -179,6 +224,20 @@ const hslToHex = (h, s, l) => {
   return rgbToHex(255 * f(0), 255 * f(8), 255 * f(4))
 }
 
+// WordPress puts its default editor palette (vivid cyan blue, luminous orange,
+// ...), its gradient presets and its block-button greys into every page's CSS.
+// Those are the CMS's colours, not the brand's, so drop them before counting.
+// A block theme's own palette uses its own slugs and is kept.
+const WP_CORE_PALETTE = 'black|cyan-bluish-gray|white|pale-pink|vivid-red|luminous-vivid-orange|luminous-vivid-amber|light-green-cyan|vivid-green-cyan|pale-cyan-blue|vivid-cyan-blue|vivid-purple'
+const WP_CORE_COLOR_VAR = new RegExp(`--wp--preset--color--(?:${WP_CORE_PALETTE})\\s*:[^;}]*;?`, 'gi')
+function stripCmsDefaults(css) {
+  return String(css || '')
+    .replace(WP_CORE_COLOR_VAR, '')
+    .replace(/--wp--preset--gradient--[\w-]+\s*:[^;}]*;?/gi, '')
+    .replace(/--wp-(?!-)[\w-]+\s*:[^;}]*;?/gi, '') // editor internals, e.g. --wp-block-synced-color
+    .replace(/[^{}]*(?:\.has-[\w-]+-gradient-background|\.wp-(?:block|element))[^{}]*\{[^{}]*\}/gi, '')
+}
+
 // Pull brand colors from CSS in ANY common format (hex, rgb/rgba, hsl/hsla),
 // normalize to hex, and rank by frequency.
 function extractColors(css) {
@@ -199,10 +258,16 @@ function extractColors(css) {
 function extractFonts(css) {
   const generic = /^(sans-serif|serif|monospace|system-ui|ui-monospace|ui-serif|ui-sans-serif|inherit|initial|unset|-apple-system|blinkmacsystemfont|arial|helvetica|times|courier|georgia|verdana|tahoma|segoe ui)$/i
   const counts = {}
+  // Themes often write `font-family: var(--body-fonts)`; resolve those custom
+  // properties to the real family names instead of counting "var(--body-fonts)".
+  const vars = {}
+  for (const m of css.matchAll(/(--[\w-]+)\s*:\s*([^;}{]+)/g)) vars[m[1]] ??= m[2]
+  const resolve = (v, depth = 0) => depth > 3 ? v
+    : v.replace(/var\(\s*(--[\w-]+)\s*(?:,\s*([^)]*))?\)/g, (_, name, fallback) => (vars[name] ? resolve(vars[name], depth + 1) : fallback || ''))
   ;(css.match(/font-family\s*:\s*([^;}{]+)/gi) || []).forEach((decl) => {
-    ;(decl.split(':')[1] || '').split(',').forEach((name) => {
-      const n = name.replace(/["']/g, '').trim()
-      if (n && !generic.test(n) && n.length < 40) counts[n] = (counts[n] || 0) + 1
+    resolve(decl.slice(decl.indexOf(':') + 1)).split(',').forEach((name) => {
+      const n = name.replace(/["']/g, '').replace(/!important/i, '').trim()
+      if (n && !generic.test(n) && !/^var\(/i.test(n) && n.length < 40) counts[n] = (counts[n] || 0) + 1
     })
   })
   return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([f]) => f)
@@ -294,7 +359,7 @@ export async function extractBrandFromSite(url) {
   )
   const css = [pages.map((p) => p.css).join('\n'), ...cssTexts].join('\n')
 
-  const colors = extractColors(css)
+  const colors = extractColors(stripCmsDefaults(css))
   const fonts = extractFonts(css)
   const corpus = pages.map((p) => `## ${p.title} (${p.url})\n${p.text.slice(0, 2200)}`).join('\n\n').slice(0, 16000)
 

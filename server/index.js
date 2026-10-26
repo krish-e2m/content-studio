@@ -717,6 +717,9 @@ app.post(
       const { data, meta } = await extractBrandFromSite(url)
       res.json({ data, meta })
     } catch (e) {
+      // the UI swallows this (the browser extractor may still succeed), so the
+      // log file is the only place the reason shows up
+      log.warn('[brand] website extraction failed', { url, message: e.message })
       res.status(502).json({ error: e.message || 'extraction failed' })
     }
   }),
@@ -1575,6 +1578,7 @@ app.post(
         lighting: b.lighting,
         aspect: b.aspect,
         brandColors: b.brandColors,
+        useBrandColors: typeof b.useBrandColors === 'boolean' ? b.useBrandColors : undefined,
         documents,
         avoid: b.avoid,
         logo: b.logo,
@@ -1590,7 +1594,7 @@ app.post(
         `aspect=${mods.aspect || b.aspect || 'square'}`,
         `refs=${mods.references ?? (Array.isArray(b.references) ? b.references.length : 0)}`,
         `logo=${mods.logo === true ? 'on' : 'off'}`,
-        `palette=${Array.isArray(mods.brandColors) ? mods.brandColors.length : (Array.isArray(b.brandColors) ? b.brandColors.length : 0)}`,
+        `palette=${mods.brandColorsOff ? 'off' : Array.isArray(mods.brandColors) ? mods.brandColors.length : (Array.isArray(b.brandColors) ? b.brandColors.length : 0)}`,
         `docs=${Array.isArray(mods.documents) && mods.documents.length ? mods.documents.join('|') : (documents.map((d) => d.name).filter(Boolean).join('|') || 'none')}`,
       ].join(' · ')
       console.log(

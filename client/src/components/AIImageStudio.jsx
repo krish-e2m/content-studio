@@ -168,6 +168,8 @@ export default function AIImageStudio({ client, photos = [], addGeneratedPhoto, 
         count,
         avoid: avoid.trim(),
         brandColors: usePalette ? brandColors : [],
+        // tells the server to also drop colour guidance from the brand docs
+        useBrandColors: usePalette,
         logo: addLogo,
         references: references.map((r) => r.url),
       })
